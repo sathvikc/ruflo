@@ -4,9 +4,11 @@
  */
 
 import { mkdirSync, writeFileSync, existsSync, readFileSync, statSync, unlinkSync, readdirSync, rmSync } from 'fs';
+import * as nodeFs from 'fs';
 import { dirname, join, resolve } from 'path';
 import { type MCPTool, getProjectCwd } from './types.js';
 import { validateIdentifier, validateText, validatePath } from './validate-input.js';
+import { checkCommandLoop, recordCommandOutcome } from './tool-loop-guardrail.js';
 
 // Real vector search functions - lazy loaded to avoid circular imports
 let searchEntriesFn: ((options: {
@@ -20,6 +22,26 @@ let searchEntriesFn: ((options: {
   searchTime: number;
   error?: string;
 }>) | null = null;
+
+/**
+ * Strip extended-thinking blocks from text before it enters a learning
+ * trajectory (hermes-agent think_scrubber pattern). Claude models with extended
+ * thinking emit <thinking>/<think>/<reasoning> blocks; if those land in a
+ * trajectory's action/result text, the DISTILL step embeds reasoning-token
+ * content that does not generalize, contaminating pattern confidence. Boundary-
+ * gated: only strips well-formed paired tags, leaving prose that merely mentions
+ * the tag names untouched.
+ */
+export function scrubReasoningBlocks(text: string): string {
+  if (typeof text !== 'string' || text.indexOf('<') === -1) return text;
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
+    .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+    .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
+    .replace(/<thought>[\s\S]*?<\/thought>/gi, '')
+    .replace(/<REASONING_SCRATCHPAD>[\s\S]*?<\/REASONING_SCRATCHPAD>/gi, '')
+    .trim();
+}
 
 async function getRealSearchFunction() {
   if (!searchEntriesFn) {
@@ -812,6 +834,14 @@ export const hooksPreCommand: MCPTool = {
         : assessment.level >= 0.3 ? 'medium'
           : 'low';
 
+    // #6: tool-loop circuit breaker — warn/block when this exact command has
+    // failed repeatedly in a row (an agent stuck looping on a failing call).
+    const loop = checkCommandLoop(command);
+    const recommendations = assessment.warnings.length > 0
+      ? ['Review warnings before proceeding', 'Consider using safer alternative']
+      : ['Command appears safe to execute'];
+    if (loop.hint) recommendations.unshift(loop.hint);
+
     return {
       command,
       riskLevel,
@@ -820,11 +850,11 @@ export const hooksPreCommand: MCPTool = {
         severity: assessment.level >= 0.6 ? 'high' : 'medium',
         description: warning,
       })),
-      recommendations: assessment.warnings.length > 0
-        ? ['Review warnings before proceeding', 'Consider using safer alternative']
-        : ['Command appears safe to execute'],
+      recommendations,
+      loopGuard: { verdict: loop.verdict, consecutiveFailures: loop.consecutiveFailures },
       safeAlternatives: [],
-      shouldProceed: assessment.level < 0.7,
+      // Don't proceed on a high-risk command OR a hard loop-block.
+      shouldProceed: assessment.level < 0.7 && loop.verdict !== 'block',
     };
   },
 };
@@ -846,6 +876,10 @@ export const hooksPostCommand: MCPTool = {
     const success = exitCode === 0;
 
     { const v = validateText(command, 'command'); if (!v.valid) return { success: false, error: v.error }; }
+
+    // #6: feed the tool-loop circuit breaker so pre-command can warn/block on
+    // repeated consecutive failures of the same command.
+    recordCommandOutcome(command, success);
 
     // Persist command outcome via AgentDB
     let _storedIn: 'agentdb' | 'json-store' | 'none' = 'none';
@@ -884,7 +918,7 @@ export const hooksPostCommand: MCPTool = {
 
 export const hooksRoute: MCPTool = {
   name: 'hooks_route',
-  description: 'Get a 3-tier routing recommendation for a task: Tier 1 (Agent Booster, 0ms / $0 — for var-to-const, add-types, etc.), Tier 2 (Haiku — simple), Tier 3 (Sonnet/Opus — complex). Use this BEFORE spawning an agent to avoid sending simple transforms to Sonnet. Native tools have no equivalent — Claude Code does not introspect its own model-selection cost. Returns the recommended model + a `[AGENT_BOOSTER_AVAILABLE]` literal when the WASM bypass applies. Use when native Bash hooks (via Claude Code\'s settings.json) are wrong because you need Ruflo-side state — pattern persistence, neural training signals, model-routing learning, cost tracking, audit chain. For one-off shell commands, plain Bash hooks are fine.',
+  description: 'Get a 3-tier routing recommendation for a task: Tier 1 (deterministic codemod, ~0ms / $0 — for var-to-const, remove-console, add-logging), Tier 2 (Haiku — simple), Tier 3 (Sonnet/Opus — complex). Use this BEFORE spawning an agent to avoid sending simple transforms to Sonnet. Native tools have no equivalent — Claude Code does not introspect its own model-selection cost. Returns the recommended model + a `[CODEMOD_AVAILABLE]` literal when a deterministic codemod can fully apply the edit (then call hooks_codemod). Use when native Bash hooks (via Claude Code\'s settings.json) are wrong because you need Ruflo-side state — pattern persistence, neural training signals, model-routing learning, cost tracking, audit chain. For one-off shell commands, plain Bash hooks are fine.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -1209,7 +1243,7 @@ export const hooksPreTask: MCPTool = {
         ? 'low'
         : 'medium';
 
-    // Enhanced model routing with Agent Booster AST (ADR-026)
+    // Enhanced model routing with deterministic Tier-1 codemods (ADR-026, ADR-143)
     let modelRouting: Record<string, unknown> | undefined;
     try {
       const { getEnhancedModelRouter } = await import('../ruvector/enhanced-model-router.js');
@@ -1217,17 +1251,19 @@ export const hooksPreTask: MCPTool = {
       const routeResult = await router.route(description, { filePath });
 
       if (routeResult.tier === 1) {
-        // Agent Booster can handle this task
+        // Deterministic codemod can apply this edit with $0 / no LLM (ADR-143)
+        const intentType = routeResult.codemodIntent?.type ?? routeResult.agentBoosterIntent?.type;
         modelRouting = {
           tier: 1,
-          handler: 'agent-booster',
+          handler: 'codemod',
           canSkipLLM: true,
-          agentBoosterIntent: routeResult.agentBoosterIntent?.type,
-          intentDescription: routeResult.agentBoosterIntent?.description,
+          deterministic: true,
+          codemodIntent: intentType,
+          intentDescription: routeResult.codemodIntent?.description ?? routeResult.agentBoosterIntent?.description,
           confidence: routeResult.confidence,
           estimatedLatencyMs: routeResult.estimatedLatencyMs,
           estimatedCost: routeResult.estimatedCost,
-          recommendation: `[AGENT_BOOSTER_AVAILABLE] Skip LLM - use Agent Booster for "${routeResult.agentBoosterIntent?.type}"`,
+          recommendation: `[CODEMOD_AVAILABLE] Skip LLM — call hooks_codemod with intent="${intentType}" (deterministic, $0)`,
         };
       } else {
         // LLM required
@@ -2443,8 +2479,10 @@ export const hooksTrajectoryStep: MCPTool = {
   },
   handler: async (params: Record<string, unknown>) => {
     const trajectoryId = params.trajectoryId as string;
-    const action = params.action as string;
-    const result = (params.result as string) || 'success';
+    // #14: scrub extended-thinking blocks so reasoning tokens don't contaminate
+    // the learning signal (DISTILL embeds this text).
+    const action = scrubReasoningBlocks(params.action as string);
+    const result = scrubReasoningBlocks((params.result as string) || 'success');
     const quality = (params.quality as number) || 0.85;
     const timestamp = new Date().toISOString();
     const stepId = `step-${Date.now()}`;
@@ -2597,17 +2635,35 @@ export const hooksTrajectoryEnd: MCPTool = {
         const ewc = await getEWCConsolidator();
         if (ewc) {
           try {
-            // Record gradient sample for Fisher matrix update
-            // Create a simple gradient from trajectory steps
-            const gradients = new Array(384).fill(0).map((_, i) =>
-              Math.sin(i * 0.01) * (trajectory.steps.length / 10)
-            );
-            ewc.recordGradient(`trajectory-${trajectoryId}`, gradients, success);
-            const stats = ewc.getConsolidationStats();
-            ewcResult = {
-              consolidated: true,
-              penalty: stats.avgPenalty,
-            };
+            // AUDIT FIX #4: derive a REAL gradient from the trajectory's
+            // embedding (mirrors the DISTILL path, where step content is
+            // embedded via generateEmbedding) instead of a synthetic sine
+            // wave. The EWC library treats the embedding as the gradient
+            // proxy (see recordPatternOutcome in ewc-consolidation.ts).
+            let gradients: number[] | null = null;
+            try {
+              const { generateEmbedding } = await import('../memory/memory-initializer.js');
+              // Embed the same summary that was persisted for semantic search,
+              // so the Fisher update reflects the actual recorded trajectory.
+              const summary = `Task: ${trajectory.task} | Agent: ${trajectory.agent} | Steps: ${trajectory.steps.map(s => `${s.action}=>${s.result}`).join('; ')}${feedback ? ` | Feedback: ${feedback}` : ''}`;
+              const embeddingResult = await generateEmbedding(summary);
+              if (embeddingResult?.embedding && embeddingResult.embedding.length > 0) {
+                gradients = embeddingResult.embedding;
+              }
+            } catch {
+              // Embedding generation unavailable — fall through and skip EWC
+            }
+
+            if (gradients) {
+              ewc.recordGradient(`trajectory-${trajectoryId}`, gradients, success);
+              const stats = ewc.getConsolidationStats();
+              ewcResult = {
+                consolidated: true,
+                penalty: stats.avgPenalty,
+              };
+            }
+            // If no real embedding-derived gradient is available, SKIP the EWC
+            // update rather than feeding the Fisher matrix synthetic noise.
           } catch {
             // EWC consolidation failed, continue without it
           }
@@ -3057,7 +3113,26 @@ export const hooksIntelligenceLearn: MCPTool = {
     const consolidate = params.consolidate !== false;
     const startTime = Date.now();
 
-    // Get SONA statistics
+    // AUDIT FIX #5: actually TRIGGER a learning/consolidation cycle instead of
+    // only reading and echoing stats. This calls the real DISTILL path
+    // (LoRA-style confidence updates with EWC++ consolidation protection) and
+    // the background learning pass, then reports the resulting stats.
+    let distill: { patternsDistilled: number; ewcPenalty: number } | null = null;
+    let distillTriggered = false;
+    try {
+      const intelligence = await import('../memory/intelligence.js');
+      // DISTILL + CONSOLIDATE: real LoRA update with EWC++ protection
+      distill = await intelligence.distillLearning();
+      distillTriggered = distill !== null;
+      // Run background learning (ruvllm) pass as well — best-effort
+      try {
+        await intelligence.runBackgroundLearning();
+      } catch { /* best-effort */ }
+    } catch {
+      // intelligence layer unavailable — fall back to stats-only reporting
+    }
+
+    // Get SONA statistics (AFTER triggering the cycle so they reflect the update)
     let sonaStats = {
       totalPatterns: 0,
       successfulRoutings: 0,
@@ -3077,7 +3152,7 @@ export const hooksIntelligenceLearn: MCPTool = {
       };
     }
 
-    // Get EWC++ statistics and optionally trigger consolidation
+    // Get EWC++ statistics after the consolidation cycle ran
     let ewcStats = {
       consolidation: false,
       fisherUpdated: false,
@@ -3092,17 +3167,21 @@ export const hooksIntelligenceLearn: MCPTool = {
           consolidation: true,
           fisherUpdated: stats.consolidationCount > 0,
           forgettingPrevented: stats.highImportancePatterns,
-          avgPenalty: stats.avgPenalty,
+          avgPenalty: distill?.ewcPenalty ?? stats.avgPenalty,
         };
       }
     }
 
     return {
-      learned: sonaStats.totalPatterns > 0,
+      // "learned" now reflects whether a real distill cycle actually ran
+      learned: distillTriggered || sonaStats.totalPatterns > 0,
+      cycleTriggered: distillTriggered,
+      patternsDistilled: distill?.patternsDistilled ?? 0,
       duration: Date.now() - startTime,
       updates: {
         trajectoriesProcessed: sonaStats.trajectoriesProcessed,
         patternsLearned: sonaStats.totalPatterns,
+        patternsDistilled: distill?.patternsDistilled ?? 0,
         successRate: sonaStats.trajectoriesProcessed > 0
           ? (sonaStats.successfulRoutings / (sonaStats.successfulRoutings + sonaStats.failedRoutings) * 100).toFixed(1) + '%'
           : '0%',
@@ -3112,7 +3191,9 @@ export const hooksIntelligenceLearn: MCPTool = {
         average: sonaStats.avgConfidence,
         implementation: sona ? 'real-sona' : 'not-available',
       },
-      implementation: sona ? 'real-sona-learning' : 'placeholder',
+      implementation: distillTriggered
+        ? 'real-distill-consolidate'
+        : (sona ? 'real-sona-learning' : 'placeholder'),
     };
   },
 };
@@ -4016,6 +4097,152 @@ export const hooksModelStats: MCPTool = {
   },
 };
 
+// Supported source extensions for codemods.
+const CODEMOD_EXTENSIONS = new Set(['.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.mts', '.cts']);
+const CODEMOD_MAX_FILES = 2000;
+
+function codemodLangForExt(abs: string): 'javascript' | 'typescript' | 'jsx' | 'tsx' {
+  const ext = abs.slice(abs.lastIndexOf('.')).toLowerCase();
+  if (ext === '.tsx') return 'tsx';
+  if (ext === '.jsx') return 'jsx';
+  if (ext === '.js' || ext === '.mjs' || ext === '.cjs') return 'javascript';
+  return 'typescript';
+}
+
+// Deterministic codemod execution — the real Tier-1 path (ADR-143)
+export const hooksCodemod: MCPTool = {
+  name: 'hooks_codemod',
+  description: 'Apply a deterministic, $0 (no-LLM) code transform — the real Tier-1 execution path (ADR-143). Supported intents: var-to-const, remove-console, add-logging. Uses the TypeScript compiler with formatting-preserving edits (comments/whitespace survive). Targets: raw `code` (returns transformed text, writes nothing) | a single `file` | a `files` array | a `glob` pattern (batch — applies the intent across every match in one $0 call). Files are rewritten in place unless `dryRun`. Intents that need reasoning — add-types, add-error-handling, async-await — are NOT supported here; route those to a model via hooks_model-route. Use when hooks_pre-task / hooks_route returned [CODEMOD_AVAILABLE].',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string', enum: ['var-to-const', 'remove-console', 'add-logging'], description: 'Deterministic codemod to apply' },
+      file: { type: 'string', description: 'Path to a single existing source file to transform in place' },
+      files: { type: 'array', items: { type: 'string' }, description: 'Multiple file paths to transform in one batch call' },
+      glob: { type: 'string', description: 'Glob pattern (relative to project root, e.g. "src/**/*.ts") — applies the intent to every matching source file' },
+      code: { type: 'string', description: 'Raw source to transform instead of files (returns transformed code, writes nothing)' },
+      language: { type: 'string', enum: ['javascript', 'typescript', 'jsx', 'tsx'], description: 'Language hint for raw code (default typescript; inferred from extension for files)' },
+      dryRun: { type: 'boolean', description: 'Report what would change without writing files' },
+    },
+    required: ['intent'],
+  },
+  handler: async (params: Record<string, unknown>) => {
+    const intent = params.intent as string;
+    const file = params.file as string | undefined;
+    const files = Array.isArray(params.files) ? (params.files as string[]) : undefined;
+    const glob = params.glob as string | undefined;
+    const rawCode = params.code as string | undefined;
+    const dryRun = params.dryRun === true;
+    const langParam = params.language as string | undefined;
+
+    const { applyCodemod, isDeterministicCodemod } = await import('../ruvector/codemods/engine.js');
+    if (!isDeterministicCodemod(intent)) {
+      return {
+        success: false,
+        error: `"${intent}" is not a deterministic codemod. Route it to a model via hooks_model-route (Tier 2/3).`,
+      };
+    }
+
+    // Mode A: transform raw code (never touches disk)
+    if (typeof rawCode === 'string') {
+      const language = (langParam as 'javascript' | 'typescript' | 'jsx' | 'tsx') ?? 'typescript';
+      const r = applyCodemod(intent, rawCode, { language });
+      return {
+        success: r.success, intent, mode: 'code', changed: r.changed, edits: r.edits,
+        output: r.output, language: r.language, reason: r.reason, cost: 0, tier: 1,
+      };
+    }
+
+    const cwd = getProjectCwd();
+
+    // Resolve the target file set (single / array / glob), with path containment.
+    const resolveTargets = (): { abs: string[]; truncated: boolean; error?: string } => {
+      const out = new Set<string>();
+      const addRaw = (p: string): string | undefined => {
+        const v = validatePath(p, 'path');
+        if (!v.valid) return v.error;
+        const abs = resolve(cwd, v.sanitized);
+        if (!abs.startsWith(cwd)) return `path escapes project root: ${p}`;
+        out.add(abs);
+        return undefined;
+      };
+
+      if (file) { const e = addRaw(file); if (e) return { abs: [], truncated: false, error: e }; }
+      if (files) for (const p of files) { const e = addRaw(p); if (e) return { abs: [], truncated: false, error: e }; }
+      if (glob) {
+        if (glob.includes('..')) return { abs: [], truncated: false, error: 'glob must not contain ".."' };
+        // fs.globSync is Node 22+; @types/node here predates it, so type it locally.
+        const globSync = (nodeFs as { globSync?: (p: string, o?: { cwd?: string }) => string[] }).globSync;
+        if (typeof globSync !== 'function') {
+          return { abs: [], truncated: false, error: 'glob requires Node 22+ (fs.globSync unavailable); pass `files[]` instead' };
+        }
+        let matches: string[] = [];
+        try {
+          matches = globSync(glob, { cwd });
+        } catch (err) {
+          return { abs: [], truncated: false, error: `glob failed: ${(err as Error).message}` };
+        }
+        for (const m of matches) {
+          const abs = resolve(cwd, m);
+          if (abs.startsWith(cwd) && CODEMOD_EXTENSIONS.has(abs.slice(abs.lastIndexOf('.')).toLowerCase())) {
+            out.add(abs);
+          }
+        }
+      }
+
+      const all = [...out];
+      const truncated = all.length > CODEMOD_MAX_FILES;
+      return { abs: truncated ? all.slice(0, CODEMOD_MAX_FILES) : all, truncated };
+    };
+
+    const targets = resolveTargets();
+    if (targets.error) return { success: false, error: targets.error };
+    if (targets.abs.length === 0) {
+      return { success: false, error: 'No target files. Provide `code`, `file`, `files[]`, or a matching `glob`.' };
+    }
+
+    // Apply to each file.
+    const results: Array<Record<string, unknown>> = [];
+    let filesChanged = 0, totalEdits = 0, failures = 0, skipped = 0;
+
+    for (const abs of targets.abs) {
+      const rel = abs.startsWith(cwd) ? abs.slice(cwd.length).replace(/^[/\\]/, '') : abs;
+      if (!existsSync(abs)) { results.push({ file: rel, success: false, reason: 'not found' }); failures++; continue; }
+      if (!CODEMOD_EXTENSIONS.has(abs.slice(abs.lastIndexOf('.')).toLowerCase())) {
+        results.push({ file: rel, success: false, reason: 'unsupported extension' }); skipped++; continue;
+      }
+      const before = readFileSync(abs, 'utf-8');
+      const r = applyCodemod(intent, before, { language: codemodLangForExt(abs) });
+      if (!r.success) { results.push({ file: rel, success: false, changed: false, reason: r.reason }); failures++; continue; }
+      const written = r.changed && !dryRun;
+      if (written) writeFileSync(abs, r.output, 'utf-8');
+      if (r.changed) { filesChanged++; totalEdits += r.edits; }
+      results.push({ file: rel, success: true, changed: r.changed, edits: r.edits, written });
+    }
+
+    const single = targets.abs.length === 1 && !files && !glob;
+    return {
+      success: failures === 0,
+      intent,
+      mode: single ? (dryRun ? 'dry-run' : 'file') : (dryRun ? 'batch-dry-run' : 'batch'),
+      summary: {
+        filesScanned: targets.abs.length,
+        filesChanged,
+        filesUnchanged: targets.abs.length - filesChanged - failures - skipped,
+        totalEdits,
+        failures,
+        skipped,
+        truncatedAt: targets.truncated ? CODEMOD_MAX_FILES : undefined,
+      },
+      results: results.slice(0, 500),
+      resultsTruncated: results.length > 500,
+      cost: 0,
+      tier: 1,
+      timestamp: new Date().toISOString(),
+    };
+  },
+};
+
 // Simple fallback complexity analyzer
 function analyzeComplexityFallback(task: string): number {
   const taskLower = task.toLowerCase();
@@ -4183,6 +4410,8 @@ export const hooksTools: MCPTool[] = [
   hooksModelRoute,
   hooksModelOutcome,
   hooksModelStats,
+  // Deterministic Tier-1 codemod execution (ADR-143)
+  hooksCodemod,
 ];
 
 export default hooksTools;

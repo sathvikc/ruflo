@@ -286,7 +286,7 @@ function getModelName() {
                 const ts = usage[id] && usage[id].lastUsedAt ? new Date(usage[id].lastUsedAt).getTime() : 0;
                 if (ts > latest) { latest = ts; modelId = id; }
               }
-              if (modelId.includes('opus')) return 'Opus 4.7';
+              if (modelId.includes('opus')) return 'Opus 4.8';
               if (modelId.includes('sonnet')) return 'Sonnet 4.6';
               if (modelId.includes('haiku')) return 'Haiku 4.5';
               return modelId.split('-').slice(1, 3).join(' ');
@@ -302,7 +302,7 @@ function getModelName() {
   const settings = getSettings();
   if (settings && settings.model) {
     const m = settings.model;
-    if (m.includes('opus')) return 'Opus 4.7';
+    if (m.includes('opus')) return 'Opus 4.8';
     if (m.includes('sonnet')) return 'Sonnet 4.6';
     if (m.includes('haiku')) return 'Haiku 4.5';
   }
@@ -372,6 +372,20 @@ function getPkgVersion() {
       path.join(CWD, 'node_modules', 'ruflo', 'package.json'),
       path.join(CWD, 'v3', '@claude-flow', 'cli', 'package.json'),
     ];
+    // #2221: global installs (npm i -g ruflo) live outside CWD/node_modules, so the
+    // probes above all miss and the version falls back to the hard-coded default.
+    // Derive the global node_modules dir from the running node binary (no npm spawn —
+    // statusline renders often). Covers nvm/mise (bin/../lib/node_modules) and Windows
+    // (bin/node_modules) layouts.
+    try {
+      const binDir = path.dirname(process.execPath);
+      for (const gm of [path.join(binDir, '..', 'lib', 'node_modules'), path.join(binDir, 'node_modules')]) {
+        pkgPaths.push(
+          path.join(gm, 'ruflo', 'package.json'),
+          path.join(gm, '@claude-flow', 'cli', 'package.json'),
+        );
+      }
+    } catch { /* ignore */ }
     for (const p of pkgPaths) {
       if (!fs.existsSync(p)) continue;
       try {

@@ -1078,7 +1078,7 @@ export async function bridgeDeleteEntry(options: {
 export async function bridgeGenerateEmbedding(
   text: string,
   dbPath?: string,
-): Promise<{ embedding: number[]; dimensions: number; model: string } | null> {
+): Promise<{ embedding: number[]; dimensions: number; model: string; backend?: 'onnx' | 'mock' } | null> {
   const registry = await getRegistry(dbPath);
   if (!registry) return null;
 
@@ -1090,10 +1090,16 @@ export async function bridgeGenerateEmbedding(
     const emb = await embedder.embed(text);
     if (!emb) return null;
 
+    // AUDIT #3: surface backend truthfully. AgentDB's embedder is a real ONNX
+    // model when present; if it ever exposes a mock/stub signal, honor it.
+    const isMock = (embedder as { isMock?: boolean; backend?: string }).isMock === true
+      || (embedder as { backend?: string }).backend === 'mock';
+
     return {
       embedding: Array.from(emb),
       dimensions: emb.length,
       model: 'Xenova/all-MiniLM-L6-v2',
+      backend: isMock ? 'mock' : 'onnx',
     };
   } catch {
     return null;
@@ -1471,6 +1477,42 @@ export async function bridgeSearchPatterns(options: {
         })) : [],
         controller: 'reasoningBank',
       };
+    }
+
+    // #2226 — the wired-in LocalReasoningBank implements store() + findSimilar()/getAll()
+    // but NOT searchPatterns()/search(). bridgeStorePattern commits patterns to its
+    // store(), so search MUST read the SAME backend or stored patterns are never found
+    // (previously search fell through to the disjoint sql.js 'pattern' namespace, which
+    // the store never wrote to → always-empty results). Adapt findSimilar (semantic) with
+    // a getAll() substring fallback so freshly-stored patterns are visible. This mirrors
+    // what hooks_intelligence_pattern-search already does against the same backend.
+    if (reasoningBank && typeof reasoningBank.findSimilar === 'function') {
+      const k = options.topK || 5;
+      const threshold = options.minConfidence ?? 0.3;
+      let mapped: Array<{ id: string; content: string; score: number }> = [];
+      try {
+        const { generateEmbedding } = await import('./memory-initializer.js');
+        const qEmb = await generateEmbedding(options.query);
+        if (qEmb && Array.isArray(qEmb.embedding) && qEmb.embedding.length > 0) {
+          const hits = reasoningBank.findSimilar(qEmb.embedding, { k, threshold });
+          mapped = (Array.isArray(hits) ? hits : []).map((r: any) => ({
+            id: r.id ?? '',
+            content: r.content ?? '',
+            score: r.confidence ?? r.score ?? 0,
+          }));
+        }
+      } catch { /* embedding unavailable — fall through to substring scan */ }
+
+      // Deterministic substring fallback over the same in-memory store.
+      if (mapped.length === 0 && typeof reasoningBank.getAll === 'function') {
+        const q = options.query.toLowerCase();
+        mapped = (reasoningBank.getAll() as any[])
+          .filter((p: any) => typeof p.content === 'string' && p.content.toLowerCase().includes(q))
+          .slice(0, k)
+          .map((p: any) => ({ id: p.id ?? '', content: p.content ?? '', score: p.confidence ?? 0 }));
+      }
+
+      return { results: mapped, controller: 'reasoningBank' };
     }
 
     // Fallback: search via bridge
